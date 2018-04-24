@@ -12,14 +12,17 @@
 -export([open/1, open/2]).
 -export([init/1, init/3]).
 -export([close/1]).
--export([send_message/5]).
--export([recv_message/4]).
+-export([io_request/3, io_request/4]). %% Default addresses
+-export([io_request/5, io_request/6]). %% Address parameters
+-export([send_message/4]).
 -export([recv/2, recv/3]).
 -export([wait_address/2]).
 -export([ident/2, get_basic_info/1]).
 -export([sensor_read/2]).
 -export([turn_on/2, turn_on/3]).
 -export([turn_off/1]).
+-export([heat_keep_alive/1]). %% Default addresses
+-export([heat_keep_alive/3]). %% Address parameters
 -export([fuel_prime/2]).
 -export([get_fault_count/1]).
 -export([clear_faults/1]).
@@ -27,14 +30,15 @@
 
 -compile(export_all).
 
--define(dbg(F,A), ok).
-%% -define(dbg(F,A), io:format((F),(A))).
-
 -define(NUM_RETRIES, 2).
 -define(DEFAULT_BAUD, 2400).
 -define(RECV_TIMEOUT, 1000).
 -define(BREAK_TIME, 30).
 -define(PAUSE_TIME, 45).
+-define(DEFAULT_SEND_ADDR, (?WBUS_CADDR bsl 4) bor ?WBUS_HADDR).
+-define(DEFAULT_RECV_ADDR, (?WBUS_HADDR bsl 4) bor ?WBUS_CADDR).
+-define(SEND_ADDR(Client, Host), (Client bsl 4) bor Host).
+-define(RECV_ADDR(Client, Host), (Host bsl 4) bor Client).
 
 -spec open(Device::string()) -> {'error',_} | {'ok',port()}.
 open(Device) ->
@@ -52,7 +56,7 @@ init(U) ->
     init(U, ?BREAK_TIME, ?PAUSE_TIME).
 
 init(U, Break, Pause) ->
-    ?dbg("send break\n", []),
+    lager:debug("send break\n", []),
     ok = uart:break(U, Break),
     ok = timer:sleep(Pause),
     ok = uart:flush(U, input).
@@ -62,18 +66,69 @@ close(U) ->
     uart:close(U).
 
 %% Send Wbus message
--spec send_message(port(), integer(), integer(), binary(), binary()) ->
+-spec send_message(port(), integer(), integer(), list(binary())) ->
 			  ok |
 			  {error, _}.
-send_message(U, Addr, Cmd, Data, Data2) when is_port(U) ->
-    Len = byte_size(Data)+byte_size(Data2)+2,
+send_message(U, Addr, Cmd, [Data1, Data2, Data3]) when is_port(U) ->
+    Len = byte_size(Data1)+byte_size(Data2)+byte_size(Data3)+2,
     Header = <<Addr, Len, Cmd>>,
     Chk1 = checksum(Header, 0),
-    Chk2 = checksum(Data, Chk1),
+    Chk2 = checksum(Data1, Chk1),
     Chk3 = checksum(Data2, Chk2),
-    Message = <<Header/binary, Data/binary, Data2/binary, Chk3>>,
-    ?dbg("sending message: header=~p, data=~w, data2=~w, check=~w\n", 
-	 [Header, Data, Data2, Chk3]),
+    Chk4 = checksum(Data3, Chk3),
+    Message = <<Header/binary, Data1/binary, Data2/binary, Data3/binary, Chk4>>,
+    lager:debug("sending message: header=~p, data=~w, data2=~w, data3=~w, "
+		"check=~w\n", [Header, Data1, Data2, Data3, Chk4]),
+    ok = uart:send(U, Message),  %% Send message
+    MessageSize = byte_size(Message),
+    %% Read and check echoed Message
+    case recv(U, MessageSize) of
+	{ok,Message} -> ok;
+	{ok,BadData} -> {error, {bad_data, BadData}};
+	Error -> Error
+    end;
+send_message(U, Addr, Cmd, [Data1, Data2]) when is_port(U) ->
+    Len = byte_size(Data1)+byte_size(Data2)+2,
+    Header = <<Addr, Len, Cmd>>,
+    Chk1 = checksum(Header, 0),
+    Chk2 = checksum(Data1, Chk1),
+    Chk3 = checksum(Data2, Chk2),
+    Message = <<Header/binary, Data1/binary, Data2/binary, Chk3>>,
+    lager:debug("sending message: header=~p, data=~w, data2=~w, check=~w\n",
+	 [Header, Data1, Data2, Chk3]),
+    ok = uart:send(U, Message),  %% Send message
+    MessageSize = byte_size(Message),
+    %% Read and check echoed Message
+    case recv(U, MessageSize) of
+	{ok,Message} -> ok;
+	{ok,BadData} -> {error, {bad_data, BadData}};
+	Error -> Error
+    end;
+
+send_message(U, Addr, Cmd, [Data1]) when is_port(U) ->
+    Len = byte_size(Data1)+2,
+    Header = <<Addr, Len, Cmd>>,
+    Chk1 = checksum(Header, 0),
+    Chk2 = checksum(Data1, Chk1),
+    Message = <<Header/binary, Data1/binary, Chk2>>,
+    lager:debug("sending message: header=~p, data=~w, check=~w\n",
+	 [Header, Data1, Chk2]),
+    ok = uart:send(U, Message),  %% Send message
+    MessageSize = byte_size(Message),
+    %% Read and check echoed Message
+    case recv(U, MessageSize) of
+	{ok,Message} -> ok;
+	{ok,BadData} -> {error, {bad_data, BadData}};
+	Error -> Error
+    end;
+
+send_message(U, Addr, Cmd, []) when is_port(U) ->
+    Len = 2,
+    Header = <<Addr, Len, Cmd>>,
+    Chk1 = checksum(Header, 0),
+    Message = <<Header/binary, Chk1>>,
+    lager:debug("sending message: header=~p, check=~w\n", 
+	 [Header, Chk1]),
     ok = uart:send(U, Message),  %% Send message
     MessageSize = byte_size(Message),
     %% Read and check echoed Message
@@ -82,7 +137,6 @@ send_message(U, Addr, Cmd, Data, Data2) when is_port(U) ->
 	{ok,BadData} -> {error, {bad_data, BadData}};
 	Error -> Error
     end.
-
 recv_message(U, Addr, Cmd, Skip) when is_port(U) ->
     case wait_address(U, Addr) of
 	ok ->
@@ -93,11 +147,11 @@ recv_message(U, Addr, Cmd, Skip) when is_port(U) ->
 		       true ->
 			    Chk0 = checksum(<<Addr,Len,Cmd1>>, 0),
 			    {ok,Chk1,_Data0} = recv(U, Skip, Chk0),
-			    ?dbg("recv_data ~w = ~p check1=~w\n", 
+			    lager:debug("recv_data ~w = ~p check1=~w\n",
 				 [Skip,_Data0,Chk1]),
 			    Len1 = Len - 2 - Skip,
 			    {ok,Chk2,Data} = recv(U, Len1, Chk1),
-			    ?dbg("recv_data ~w = ~p check2=~w\n", 
+			    lager:debug("recv_data ~w = ~p check2=~w\n",
 				 [Len1,Data,Chk2]),
 			    case recv(U, 1) of
 				{ok, <<Chk2>>} ->
@@ -123,8 +177,10 @@ recv(U, Len, Chk) when is_port(U) ->
     case recv(U, Len) of
 	{ok,Data} ->
 	    Chk1 = checksum(Data, Chk),
+	    lager:debug("got data ~p with checksum ~p", [Data, Chk1]),
 	    {ok, Chk1, Data};
 	Error ->
+	    lager:debug("got error ~p",[Error]),
 	    Error
     end.
 
@@ -142,7 +198,7 @@ recv_(_U, 0, Acc) ->
 recv_(U, Len, Acc) when is_port(U) ->
     case uart:recv(U, 1, ?RECV_TIMEOUT) of
 	{ok,<<C>>} ->
-	    ?dbg("recv_data got ~w\n", [C]),
+	    lager:debug("recv_data got ~w\n", [C]),
 	    recv_(U, Len-1, <<Acc/binary, C>>);
 	Error ->
 	    io:format("got error ~p\n", [Error]),
@@ -162,48 +218,75 @@ wait_address(U, Addr) when is_port(U) ->
     end.
 
 
+%% Send a client W-Bus request and read answer from Heater.
+-spec io_request(U::port(), Cmd::integer(),
+		 Client::integer(), Host::integer(),
+		 DataList::list(binary())) ->
+		   {ok, Data::binary()} |
+		   {error, term()}.
+io_request(U, Cmd, Client, Host, DataList) when is_port(U) ->
+    io_request_retry(U, Cmd,
+		     ?SEND_ADDR(Client, Host),
+		     ?RECV_ADDR(Client, Host),
+		     DataList, 0, ?NUM_RETRIES).
+
+-spec io_request(U::port(), Cmd::integer(),
+		 Client::integer(), Host::integer(),
+		 DataList::list(binary()), Skip::integer()) ->
+		   {ok, Data::binary()} |
+		   {error, term()}.
+io_request(U, Cmd, Client, Host, DataList, Skip) when is_port(U) ->
+    io_request_retry(U, Cmd,
+		     ?SEND_ADDR(Client, Host),
+		     ?RECV_ADDR(Client, Host),
+		     DataList, Skip, ?NUM_RETRIES).
 
 %% Send a client W-Bus request and read answer from Heater.
--spec io_request(U::port(), Cmd::integer(), 
-		 Data::binary(), Data2::binary(), 
+-spec io_request(U::port(), Cmd::integer(), DataList::list(binary())) ->
+		   {ok, Data::binary()} |
+		   {error, term()}.
+io_request(U, Cmd, DataList) when is_port(U) ->
+    io_request_retry(U, Cmd, ?DEFAULT_SEND_ADDR, ?DEFAULT_RECV_ADDR,
+		     DataList, 0, ?NUM_RETRIES).
+
+-spec io_request(U::port(), Cmd::integer(), DataList::list(binary()),
 		 Skip::integer()) ->
 		   {ok, Data::binary()} |
 		   {error, term()}.
-io_request(U, Cmd, Data, Data2, Skip) when is_port(U) ->
-    io_request(U, Cmd, Data, Data2, Skip, ?NUM_RETRIES).
+io_request(U, Cmd, DataList, Skip) when is_port(U) ->
+    io_request_retry(U, Cmd, ?DEFAULT_SEND_ADDR, ?DEFAULT_RECV_ADDR,
+		     DataList, Skip, ?NUM_RETRIES).
 
--spec io_request(U::port(), Cmd::integer(), 
-		 Data::binary(), Data2::binary(), 
-		 Skip::integer(), Retries::integer()) ->
-		   {ok, Data::binary()} |
-		   {error, term()}.
-io_request(U, Cmd, Data, Data2, Skip, Retries) when is_port(U) ->
-    io_try_request(U, Cmd, Data, Data2, Skip, Retries).
+-spec io_request_retry(U::port(), Cmd::integer(),
+		       SendAddress::integer(), RecvAddress::integer(),
+		       DataList::list(binary()),
+		       Skip::integer(), Retries::integer()) ->
+			      {ok, Data::binary()} |
+			      {error, term()}.
+io_request_retry(U, Cmd, SendAddr, RecvAddr, DataList, Skip, Retries) 
+  when is_port(U) ->
+    io_try_request(U, Cmd, SendAddr, RecvAddr, DataList, Skip, Retries).
 
-io_try_request(_U, _Cmd, _Data, _Data2, _Skip, I) when I < 0 ->
+io_try_request(_U, _Cmd, _SendAddr, _RecvAddr, _DataList, _Skip, I) 
+  when I < 0 ->
     {error, too_many_retries};
-io_try_request(U, Cmd, Data, Data2, Skip, I) when is_port(U) ->
+io_try_request(U, Cmd, SendAddr, RecvAddr, DataList, Skip, I) 
+  when is_port(U) ->
     timer:sleep(50),
-    case io_do_request(U, Cmd, Data, Data2, Skip) of
+    case io_do_request(U, Cmd, SendAddr, RecvAddr, DataList, Skip) of
 	{ok, DataOut} ->
 	    timer:sleep(30),  %% add some space for next request
 	    {ok,DataOut};
 	{error, timeout} ->
-	    io_try_request(U, Cmd, Data, Data2, Skip, I-1);
+	    io_try_request(U, Cmd, SendAddr, RecvAddr, DataList, Skip, I-1);
 	Error ->
 	    Error
     end.
 
-
-io_do_request(U, Cmd, Data, Data2, Skip) when is_port(U) ->
-    Addr = (?WBUS_CADDR bsl 4) bor ?WBUS_HADDR,
-    case send_message(U, Addr, Cmd, Data, Data2) of
+io_do_request(U, Cmd, SendAddr, RecvAddr, DataList, Skip) when is_port(U) ->
+    case send_message(U, SendAddr, Cmd, DataList) of
 	ok ->
-	    RAddr = (?WBUS_HADDR bsl 4) bor ?WBUS_CADDR,
-	    case recv_message(U, RAddr, Cmd, Skip) of
-		{ok, Data} -> {ok,Data};
-		Error -> Error
-	    end;
+	    recv_message(U, RecvAddr, Cmd, Skip);
 	Error -> Error
     end.
 
@@ -222,7 +305,9 @@ ident(U, serial, R) when is_port(U) ->  ident_(U, ?IDENT_SERIAL, R);
 ident(U, Cmd, R) when is_port(U), is_integer(Cmd) -> ident_(U, Cmd, R).
 
 ident_(U, Cmd, Retries) ->
-    io_request(U, ?WBUS_CMD_IDENT, <<Cmd>>, <<>>, 1, Retries).
+    io_request_retry(U, ?WBUS_CMD_IDENT, 
+		     ?DEFAULT_SEND_ADDR, ?DEFAULT_RECV_ADDR,
+		     [<<Cmd>>, <<>>], 1, Retries).
 
 -spec get_basic_info(U::port()) -> {ok, list()}.
 get_basic_info(U) when is_port(U) ->
@@ -250,7 +335,7 @@ sensor_read(U, Idx) when is_port(U), is_integer(Idx) ->
 	14 -> {ok, <<>>};
 	16 -> {ok, <<>>};
 	_ ->
-	    case io_request(U, ?WBUS_CMD_QUERY, <<Idx>>, <<>>, 1) of
+	    case io_request(U, ?WBUS_CMD_QUERY, [<<Idx>>, <<>>], 1) of
 		{ok, Values} -> {ok, decode_sensors(Idx, Values)};
 		Error -> Error
 	    end
@@ -283,7 +368,7 @@ get_short(Offset, Data) ->
     end.
 
 check(U, Mode) when is_port(U) ->
-    io_request(U, ?WBUS_CMD_CHK, <<Mode,0>>, <<>>, 0).
+    io_request(U, ?WBUS_CMD_CHK, [<<Mode,0>>, <<>>], 0).
 
 turn_on(U, Time) when is_port(U) -> %% default?
     turn_on(U, ?WBUS_CMD_ON, Time).
@@ -295,22 +380,28 @@ turn_on(U, ventilation, Time) when is_port(U) ->
 turn_on(U, supplemental_heating, Time) when is_port(U) ->
     turn_on(U, ?WBUS_CMD_ON_SH, Time);
 turn_on(U, Cmd, Time) when is_port(U), is_integer(Cmd) ->
-    io_request(U, Cmd, <<Time>>, <<>>, 0).
+    io_request(U, Cmd, [<<Time>>, <<>>], 0).
 
 turn_off(U) when is_port(U) ->
-    io_request(U, ?WBUS_CMD_OFF, <<>>, <<>>, 0).
+    io_request(U, ?WBUS_CMD_OFF, [], 0).
 
 fuel_prime(U,Time) when is_port(U) ->
-    io_request(U, ?WBUS_CMD_X, <<16#03,16#00,(Time bsr 1)>>, <<>>, 0).
+    io_request(U, ?WBUS_CMD_X, [<<16#03,16#00,(Time bsr 1)>>, <<>>], 0).
 
 get_fault_count(U) when is_port(U) ->
-    io_request(U, ?WBUS_CMD_ERR, <<?ERR_LIST>>, <<>>, 1).
+    io_request(U, ?WBUS_CMD_ERR, [<<?ERR_LIST>>], 1).
 
 clear_faults(U) when is_port(U) ->
-    io_request(U, ?WBUS_CMD_ERR, <<?ERR_DEL>>, <<>>, 0).
+    io_request(U, ?WBUS_CMD_ERR, [<<?ERR_DEL>>], 0).
 
 get_fault(U, ErrorNumber) when is_port(U) ->
-    io_request(U, ?WBUS_CMD_ERR, <<?ERR_READ,ErrorNumber>>, <<>>,  1).
+    io_request(U, ?WBUS_CMD_ERR, [<<?ERR_READ,ErrorNumber>>, <<>>],  1).
+
+heat_keep_alive(U) when is_port(U) ->
+    io_request(U, ?WBUS_CMD_CHK, [<<16#2a>>, <<>>], 0).
+heat_keep_alive(U, Client, Host) when is_port(U) ->
+    io_request(U, ?WBUS_CMD_CHK, Client, Host, [<<16#2a>>, <<>>], 0).
+
 
 -spec checksum(Data::binary(), Chk::integer()) ->
     integer().
